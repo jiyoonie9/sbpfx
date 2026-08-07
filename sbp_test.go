@@ -1,6 +1,8 @@
 package sbpfx_test
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -150,4 +152,63 @@ func TestForDateInvalidFormat(t *testing.T) {
 	// But more importantly, the function shouldn't crash
 	assert.True(t, len(url1) > 0, "Should still generate a URL even with invalid date")
 	assert.True(t, len(url2) > 0, "Should generate a URL with default date")
+}
+
+// currentEraPaths are the two candidate paths sbpfx tries for a current-era
+// date: the long prefixed name first, then the bare DD-Mon-YY fallback.
+var currentEraPaths = []string{
+	"/mark-to-market-revaluation-exchange-rate-06-august-2026.pdf",
+	"/06-Aug-26.pdf",
+}
+
+// serveStatus returns a client pointed at a stub host that answers every
+// request with the given status and headers, plus the paths it was asked for.
+func serveStatus(t *testing.T, status int, headers map[string]string) (*sbpfx.Client, *[]string) {
+	t.Helper()
+
+	var requested []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(server.Close)
+
+	return sbpfx.New(httpr.BaseURL(server.URL)), &requested
+}
+
+func TestFetchErrorNamesEveryCandidatePath(t *testing.T) {
+	client, requested := serveStatus(t, http.StatusNotFound, nil)
+
+	_, err := client.GetExchangeRates(t.Context(), sbpfx.ForDate("2026-08-06"))
+	assert.Error(t, err, "missing sheet should error")
+	assert.Equal(t, currentEraPaths, *requested, "both candidates should be tried")
+
+	// Reporting only the last candidate hides the primary path and reads as if
+	// the client had built the wrong URL.
+	for _, path := range currentEraPaths {
+		assert.Contains(t, err.Error(), path, "error should name candidate %s", path)
+	}
+
+	assert.Contains(t, err.Error(), "PDF not found", "a real 404 is still a missing PDF")
+}
+
+func TestFetchErrorReportsBotProtectionBlock(t *testing.T) {
+	// sbp.org.pk sits behind Cloudflare: a challenged request gets a 403 and an
+	// HTML interstitial for every path, including ones that host a real sheet.
+	client, requested := serveStatus(t, http.StatusForbidden, map[string]string{
+		"Cf-Mitigated": "challenge",
+		"Content-Type": "text/html; charset=UTF-8",
+	})
+
+	_, err := client.GetExchangeRates(t.Context(), sbpfx.ForDate("2026-08-06"))
+	assert.Error(t, err, "a blocked request should error")
+	assert.Equal(t, currentEraPaths, *requested, "both candidates should be tried")
+
+	assert.Contains(t, err.Error(), "blocked by bot protection", "error should name the block")
+	assert.NotContains(t, err.Error(), "PDF not found", "a block says nothing about the sheet existing")
 }

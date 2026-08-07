@@ -19,6 +19,13 @@ const (
 	ratePrefix     = "/mark-to-market-revaluation-exchange-rate"
 	pdfSignature   = "%PDF"            // PDF files begin with this magic header
 	pdfContentType = "application/pdf" // Content-Type advertised for a real sheet
+
+	// cfMitigatedHeader is set by Cloudflare when a request was challenged or
+	// blocked by its bot protection. sbp.org.pk sits behind Cloudflare, and a
+	// challenged request answers every path — including ones that host a real
+	// sheet — with a 403 and an HTML interstitial. Reporting that as "PDF not
+	// found" sends readers hunting for a URL bug that isn't there.
+	cfMitigatedHeader = "Cf-Mitigated"
 )
 
 // looksLikePDF reports whether a response body is a real rate-sheet PDF.
@@ -128,23 +135,52 @@ func New(options ...httpr.ClientOption) *Client {
 	}
 }
 
+// pathErrors reports the failure of every candidate path in one line.
+//
+// errors.Join separates its causes with newlines, which reads badly in a
+// structured log, so we keep its Unwrap() []error behaviour — errors.Is and
+// errors.As still see every cause — and format the causes on a single line.
+type pathErrors []error
+
+func (p pathErrors) Error() string {
+	msgs := make([]string, 0, len(p))
+	for _, err := range p {
+		msgs = append(msgs, err.Error())
+	}
+
+	return strings.Join(msgs, "; ")
+}
+
+func (p pathErrors) Unwrap() []error { return p }
+
 // fetchRateSheet downloads the first candidate URL that resolves to a real
 // rate-sheet PDF for the given date. It returns the PDF bytes and the full URL
-// that served them. When several candidates are tried, the error from the
-// last candidate is returned if none are fetched.
+// that served them.
+//
+// When no candidate resolves, the failures of all of them are reported. Naming
+// only the last candidate would hide the primary path, so a current-era failure
+// would name the bare DD-Mon-YY fallback (e.g. /06-Aug-26.pdf) and read as if
+// the client had built the wrong URL.
 func (c *Client) fetchRateSheet(ctx context.Context, date time.Time) ([]byte, string, error) {
-	var lastErr error
+	var errs pathErrors
 	for _, path := range ratePaths(date) {
 		content, err := c.fetchPDF(ctx, path)
 		if err != nil {
-			lastErr = err
+			errs = append(errs, err)
 			continue
 		}
 
 		return content, BaseURL + path, nil
 	}
 
-	return nil, "", lastErr
+	// ratePaths never yields an empty list, so errs always has a cause here.
+	// Returning an empty pathErrors would hand back a non-nil error interface
+	// wrapping nothing, so guard it rather than rely on that invariant.
+	if len(errs) == 0 {
+		return nil, "", fmt.Errorf("no candidate paths for date: %s", date.Format("2006-01-02"))
+	}
+
+	return nil, "", errs
 }
 
 // fetchPDF issues a single GET for a candidate path and returns its body only
@@ -157,6 +193,12 @@ func (c *Client) fetchPDF(ctx context.Context, path string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != HTTPStatusOK {
+		// A challenged request says nothing about whether the sheet exists, so
+		// name the block instead of claiming the PDF is missing.
+		if mitigated := resp.Header.Get(cfMitigatedHeader); mitigated != "" {
+			return nil, fmt.Errorf("blocked by bot protection (cf-mitigated: %s): status %d for path: %s", mitigated, resp.StatusCode, path)
+		}
+
 		return nil, fmt.Errorf("PDF not found: status %d for path: %s", resp.StatusCode, path)
 	}
 
