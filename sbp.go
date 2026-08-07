@@ -3,8 +3,10 @@ package sbpfx
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -26,7 +28,46 @@ const (
 	// sheet — with a 403 and an HTML interstitial. Reporting that as "PDF not
 	// found" sends readers hunting for a URL bug that isn't there.
 	cfMitigatedHeader = "Cf-Mitigated"
+
+	// defaultUserAgent names this client to sbp.org.pk. Cloudflare challenges
+	// the generic agents — "Go-http-client/1.1", curl's, and an empty one are
+	// all served the interstitial — but passes a UA that identifies a project
+	// and where to reach it. This is an honest identifier, not a browser
+	// impersonation; no browser UA is needed to be let through.
+	defaultUserAgent = "sbpfx/1.0 (+https://github.com/mistermoe/sbpfx)"
+
+	// Connection-pool and handshake settings, matching http.DefaultTransport.
+	maxIdleConns          = 100
+	idleConnTimeout       = 90 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	expectContinueTimeout = 1 * time.Second
 )
+
+// http1Transport returns a transport that speaks HTTP/1.1 only.
+//
+// Cloudflare fingerprints the HTTP/2 handshake, and Go's fingerprint matches no
+// browser, so an h2 request to sbp.org.pk is challenged whatever User-Agent it
+// carries. HTTP/1.1 exposes no such fingerprint, and the same request over it
+// is served the PDF.
+// It is built from scratch rather than cloned from http.DefaultTransport: the
+// clone inherits a TLSClientConfig that already advertises h2 in its ALPN list,
+// so the server answers in h2 frames that the HTTP/1.1 code path then reads as
+// a malformed response. Pinning NextProtos is what actually settles it.
+func http1Transport() *http.Transport {
+	return &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"http/1.1"},
+		},
+		MaxIdleConns:          maxIdleConns,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ExpectContinueTimeout: expectContinueTimeout,
+	}
+}
 
 // looksLikePDF reports whether a response body is a real rate-sheet PDF.
 //
@@ -123,9 +164,12 @@ type Client struct {
 }
 
 func New(options ...httpr.ClientOption) *Client {
+	// Caller options come last so any of these defaults can be overridden.
 	opts := append(
 		[]httpr.ClientOption{
 			httpr.BaseURL(BaseURL),
+			httpr.HTTPClient(http.Client{Transport: http1Transport()}),
+			httpr.Header("User-Agent", defaultUserAgent),
 		},
 		options...,
 	)

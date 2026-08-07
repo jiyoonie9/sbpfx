@@ -212,3 +212,36 @@ func TestFetchErrorReportsBotProtectionBlock(t *testing.T) {
 	assert.Contains(t, err.Error(), "blocked by bot protection", "error should name the block")
 	assert.NotContains(t, err.Error(), "PDF not found", "a block says nothing about the sheet existing")
 }
+
+func TestDefaultsIdentifyClientOverHTTP11(t *testing.T) {
+	// Cloudflare challenges the generic Go agent, and challenges an h2 request
+	// whatever agent it carries, so both defaults have to reach the wire.
+	var gotAgent, gotProto string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgent, gotProto = r.UserAgent(), r.Proto
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := sbpfx.New(httpr.BaseURL(server.URL))
+	_, _ = client.GetExchangeRates(t.Context(), sbpfx.ForDate("2026-08-06"))
+
+	assert.Equal(t, "sbpfx/1.0 (+https://github.com/mistermoe/sbpfx)", gotAgent, "client should identify itself")
+	assert.Equal(t, "HTTP/1.1", gotProto, "client should speak HTTP/1.1")
+}
+
+func TestCallerCanOverrideDefaultUserAgent(t *testing.T) {
+	var gotAgent string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgent = r.UserAgent()
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := sbpfx.New(httpr.BaseURL(server.URL), httpr.Header("User-Agent", "pocket/1.0"))
+	_, _ = client.GetExchangeRates(t.Context(), sbpfx.ForDate("2026-08-06"))
+
+	assert.Equal(t, "pocket/1.0", gotAgent, "caller options should win over defaults")
+}

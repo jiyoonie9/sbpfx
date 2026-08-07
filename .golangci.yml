@@ -89,6 +89,7 @@ linters:
         - encore.dev/pubsub(/.+)?\..+$
         - encore.dev/cron(/.+)?\..+$
         - encore.dev/middleware(/.+)?\..+$
+        - ^crypto/tls.Config$
         - ^net/http.Client$
         - ^net/http.Cookie$
         - ^net/http.Request$
